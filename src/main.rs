@@ -16,7 +16,7 @@ use moka::future::{Cache, CacheBuilder};
 use serde::Serialize;
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -136,12 +136,19 @@ async fn main() -> Result<()> {
 
     let state = AppState::new();
 
+    let quit_sig = async {
+        _ = tokio::signal::ctrl_c().await;
+        warn!("Initiating graceful shutdown");
+    };
+
     let app = Router::new()
         .route("/:url", get(get_status_for_server))
         .with_state(state);
     let addr: SocketAddr = "0.0.0.0:3789".parse().expect("This is a valid address");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(quit_sig)
+        .await?;
 
     Ok(())
 }
