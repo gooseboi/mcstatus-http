@@ -226,6 +226,7 @@ async fn fetch_status_from_server(
     use_mc_monitor: bool,
     mc_monitor_executable: &str,
 ) -> Result<ServerStatus, (StatusCode, String)> {
+    // FIXME: Make sure this url is actually valid
     if use_mc_monitor {
         let span = debug_span!("mc_monitor_fetch", url = url);
         fetch_status_with_mc_monitor(url, mc_monitor_executable)
@@ -286,6 +287,7 @@ async fn main() -> Result<()> {
     };
 
     let app = Router::new()
+        .route("/favicon.ico", get(favicon))
         .route("/:url", get(get_status_for_server))
         .with_state(state);
     let addr: SocketAddr = "0.0.0.0:3789".parse().expect("This is a valid address");
@@ -295,4 +297,8 @@ async fn main() -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+async fn favicon(State(_): State<AppState>) -> StatusCode {
+    StatusCode::NOT_FOUND
 }
