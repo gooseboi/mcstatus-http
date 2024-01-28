@@ -268,7 +268,7 @@ async fn get_status_for_server(
     Ok(Json::from(status))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
