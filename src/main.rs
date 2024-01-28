@@ -230,12 +230,24 @@ async fn get_status_for_server(
     let cache = state.cache.clone();
     let mc_monitor_executable = state.mc_monitor_executable;
 
-    let status = cache
-        .try_get_with_by_ref(&url, async {
-            fetch_status_from_server(&url, *state.use_mc_monitor, &mc_monitor_executable).await
-        })
-        .await
-        .map_err(|e| (*e).clone())?;
+    // This is spawned in a task so the fetch isn't killed if the request is stopped This makes it
+    // so repeated requests to the endpoint, while killing the previous request (like browser
+    // refreshes) don't hammer the mc server.
+    let handle = tokio::spawn(async move {
+        cache
+            .try_get_with_by_ref(&url, async {
+                fetch_status_from_server(&url, *state.use_mc_monitor, &mc_monitor_executable).await
+            })
+            .await
+            .map_err(|e| (*e).clone())
+    });
+    let status = handle.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to join cache thread: {e}"),
+        )
+    })?;
+    let status = status?;
 
     Ok(Json::from(status))
 }
