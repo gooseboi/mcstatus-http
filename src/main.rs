@@ -146,17 +146,26 @@ async fn fetch_status_with_mc_monitor(
     url: &str,
     mc_monitor_executable: &str,
 ) -> Result<ServerStatus, (StatusCode, String)> {
-    let output = Command::new(mc_monitor_executable)
+    let child = Command::new(mc_monitor_executable)
         .arg("status")
         .args(["-host", &url])
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to spawn mc-monitor: {e}"),
             )
         })?;
+    info!("Spawned mc_monitor");
+    let output = child.wait_with_output().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed running mc_monitor: {e}"),
+        )
+    })?;
+    info!("mc_monitor exited");
 
     let stderr = output.stderr;
     let stderr = String::from_utf8(stderr.clone()).map_err(|e| {
@@ -170,6 +179,12 @@ async fn fetch_status_with_mc_monitor(
     } else {
         Some(stderr)
     };
+
+    if stderr.is_some() {
+        info!("mc_monitor returned an error");
+    } else {
+        info!("mc_monitor return successfully");
+    }
 
     let stdout = output.stdout;
     let stdout = String::from_utf8(stdout.clone()).map_err(|e| {
