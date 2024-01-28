@@ -11,13 +11,15 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use color_eyre::Result;
+use color_eyre::{
+    eyre::{bail, ensure},
+    Result,
+};
 use moka::future::{Cache, CacheBuilder};
 use serde::Serialize;
 use std::{env, net::SocketAddr, sync::Arc};
 use tokio::process::Command;
-use tracing::{info, debug, warn, Instrument};
-use tracing::debug_span;
+use tracing::{debug, debug_span, info, warn, Instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -60,10 +62,83 @@ impl AppState {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct MonitorOutput {
+    version: String,
+    online_player_count: u16,
+    max_player_count: u16,
+    motd: String,
+}
+
+impl MonitorOutput {
+    fn parse(output: &str) -> Result<Self> {
+        let Some((_host, rest)) = output.split_once(" : ") else {
+            bail!("Command output was not separated by `:`: {output}");
+        };
+
+        let Some((version, rest)) = rest.split_once(' ') else {
+            bail!("Command output finished unexpectedly, expected ` `, found nothing: {rest}");
+        };
+
+        let Some((version_str, version)) = version.split_once('=') else {
+            bail!("Version did not contain `=`. Found: {rest}");
+        };
+        ensure!(
+            version_str == "version",
+            "Version string was invalid: {version_str}"
+        );
+        let version = version.to_owned();
+
+        let Some((online, rest)) = rest.split_once(' ') else {
+            bail!("Command output finished unexpectedly, expected ` `, found nothing: {rest}");
+        };
+
+        let Some((online_str, online_player_count)) = online.split_once('=') else {
+            bail!("Online player count did not contain `=`. Found: {rest}");
+        };
+        ensure!(
+            online_str == "online",
+            "Online string was invalid: {online_str}"
+        );
+        let online_player_count = match online_player_count.parse() {
+            Ok(c) => c,
+            Err(e) => bail!("Failed parsing player count {online_player_count}: {e}"),
+        };
+
+        let Some((max, rest)) = rest.split_once(' ') else {
+            bail!("Command output finished unexpectedly, expected ` `, found nothing: {rest}");
+        };
+
+        let Some((max_str, max_player_count)) = max.split_once('=') else {
+            bail!("Max player count did not contain `=`. Found: {rest}");
+        };
+        ensure!(max_str == "max", "Max string was invalid: {max_str}");
+        let max_player_count = match max_player_count.parse() {
+            Ok(c) => c,
+            Err(e) => bail!("Failed parsing player count {max_player_count}: {e}"),
+        };
+
+        let Some((motd_str, motd)) = rest.split_once('=') else {
+            bail!("motd did not contain `=`. Found: {rest}");
+        };
+        ensure!(motd_str == "motd", "motd string was invalid: {motd_str}");
+        // motd='Minecraft server'
+        let l = motd.len();
+        let motd = motd[1..(l - 1)].to_owned();
+
+        Ok(Self {
+            version,
+            online_player_count,
+            max_player_count,
+            motd,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ServerStatus {
     requested_url: String,
     exit_code: u8,
-    output: String,
+    output: Option<MonitorOutput>,
     error: Option<String>,
 }
 
@@ -111,10 +186,22 @@ async fn fetch_status_with_mc_monitor(
         .try_into()
         .expect("Exit codes should fit into u8s");
 
+    let output = if stderr.is_none() {
+        let output = MonitorOutput::parse(&stdout).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed parsing mc_monitor output: {e}"),
+            )
+        })?;
+        Some(output)
+    } else {
+        None
+    };
+
     Ok(ServerStatus {
         requested_url: url.to_owned(),
         exit_code,
-        output: stdout,
+        output,
         error: stderr,
     })
 }
