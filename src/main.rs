@@ -17,16 +17,26 @@ use color_eyre::{
 };
 use moka::future::{Cache, CacheBuilder};
 use serde::Serialize;
-use std::{env, net::SocketAddr, sync::Arc};
-use tokio::process::Command;
+use std::{
+    env,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+};
+use tokio::{net::TcpStream, process::Command};
 use tracing::{debug, debug_span, info, warn, Instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ServerAddr {
+    domain_name: Option<String>,
+    address: SocketAddr,
+}
 
 #[derive(Clone)]
 struct AppState {
     mc_monitor_executable: Arc<str>,
     use_mc_monitor: Arc<bool>,
-    cache: Cache<String, ServerStatus>,
+    cache: Cache<ServerAddr, ServerStatus>,
 }
 
 impl AppState {
@@ -136,19 +146,24 @@ impl MonitorOutput {
 
 #[derive(Debug, Clone, Serialize)]
 struct ServerStatus {
-    requested_url: String,
+    requested_url: SocketAddr,
     exit_code: u8,
     output: Option<MonitorOutput>,
     error: Option<String>,
 }
 
 async fn fetch_status_with_mc_monitor(
-    url: &str,
+    url: &SocketAddr,
     mc_monitor_executable: &str,
 ) -> Result<ServerStatus, (StatusCode, String)> {
     let child = Command::new(mc_monitor_executable)
         .arg("status")
-        .args(["-host", &url])
+        .args([
+            "-host",
+            &url.ip().to_string(),
+            "-port",
+            &url.port().to_string(),
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -222,13 +237,14 @@ async fn fetch_status_with_mc_monitor(
 }
 
 async fn fetch_status_from_server(
-    url: &str,
+    url: &SocketAddr,
     use_mc_monitor: bool,
     mc_monitor_executable: &str,
 ) -> Result<ServerStatus, (StatusCode, String)> {
     // FIXME: Make sure this url is actually valid
+    let url_str = format!("{ip}:{port}", ip = url.ip(), port = url.port());
     if use_mc_monitor {
-        let span = debug_span!("mc_monitor_fetch", url = url);
+        let span = debug_span!("mc_monitor_fetch", url = url_str);
         fetch_status_with_mc_monitor(url, mc_monitor_executable)
             .instrument(span)
             .await
@@ -238,21 +254,71 @@ async fn fetch_status_from_server(
 }
 
 async fn get_status_for_server(
-    Path(url): Path<String>,
+    Path(addr): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ServerStatus>, (StatusCode, String)> {
-    debug!(%url, "Requested from api");
+    debug!(%addr, "Requested from api");
 
     let cache = state.cache.clone();
     let mc_monitor_executable = state.mc_monitor_executable;
+    let domain_name = if addr.contains(|c| char::is_ascii_alphabetic(&c)) {
+        let s = if addr.split(':').count() == 1 {
+            addr.clone()
+        } else {
+            addr.split(':')
+                .next()
+                .ok_or((StatusCode::BAD_REQUEST, "Input url was empty".to_owned()))?
+                .to_owned()
+        };
+        Some(s)
+    } else {
+        None
+    };
 
+    let addr = {
+        let addr = match addr.split(':').count() {
+            0 => unreachable!(),
+            1 => format!("{addr}:25565"),
+            2 => addr,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid address {addr} for server, had too many `:`"),
+                ))
+            }
+        };
+        addr.to_socket_addrs()
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("addr {addr} was invalid: {e}"),
+                )
+            })?
+            .next()
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("{addr} was addr, no addr was there"),
+                )
+            })?
+    };
+
+    let addr = ServerAddr {
+        domain_name,
+        address: addr,
+    };
     // This is spawned in a task so the fetch isn't killed if the request is stopped This makes it
     // so repeated requests to the endpoint, while killing the previous request (like browser
     // refreshes) don't hammer the mc server.
     let handle = tokio::spawn(async move {
         cache
-            .try_get_with_by_ref(&url, async {
-                fetch_status_from_server(&url, *state.use_mc_monitor, &mc_monitor_executable).await
+            .try_get_with_by_ref(&addr, async {
+                fetch_status_from_server(
+                    &addr.address,
+                    *state.use_mc_monitor,
+                    &mc_monitor_executable,
+                )
+                .await
             })
             .await
             .map_err(|e| (*e).clone())
